@@ -37,6 +37,12 @@
             z-index: 10;
         }
 
+        #sizeText {
+            margin-top: 6px;
+            font-size: 13px;
+            color: #aaa;
+        }
+
         #progressBar {
             width: 300px;
             height: 20px;
@@ -80,6 +86,7 @@
     <div id="loadingScreen">
         <h1>Slime Rancher</h1>
         <div id="loadingText">Loading assets... 0%</div>
+        <div id="sizeText">0.00 MB / 0.00 MB</div>
         <div id="progressBar">
             <div id="progressFill"></div>
         </div>
@@ -124,32 +131,81 @@
             return originalAppendChild.call(this, element);
         };
 
+        const CACHE_NAME = 'slime-rancher-cache-v1';
         const baseUrl = 'Build/';
         const files = [
             { name: 'web.data.unityweb', chunks: 64 },
             { name: 'web.wasm.code.unityweb', chunks: 4 }
         ];
 
-        let totalChunks = 1;
-        for (let i = 0; i < files.length; i++) totalChunks += files[i].chunks;
+        const allUrls = [];
+        for (let i = 0; i < files.length; i++) {
+            for (let j = 0; j < files[i].chunks; j++) {
+                let chunkStr = j < 10 ? '0' + j : j;
+                allUrls.push(baseUrl + files[i].name + chunkStr);
+            }
+        }
+        allUrls.push(baseUrl + 'web.wasm.framework.unityweb');
+
+        let totalChunks = allUrls.length;
         let loadedChunks = 0;
+        let totalBytes = 0;
+        let loadedBytes = 0;
+
+        function formatMB(bytes) {
+            return (bytes / 1048576).toFixed(2);
+        }
 
         function updateProgress() {
             let pct = Math.floor((loadedChunks / totalChunks) * 100);
             document.getElementById('loadingText').innerText = 'Loading assets... ' + pct + '%';
             document.getElementById('progressFill').style.width = pct + '%';
+            document.getElementById('sizeText').innerText = formatMB(loadedBytes) + ' MB / ' + formatMB(totalBytes) + ' MB';
         }
 
-        async function fetchChunk(url) {
-            let response = await fetch(url);
-            let data = await response.arrayBuffer();
+        async function computeTotalBytes(cache) {
+            let sizes = await Promise.all(allUrls.map(async (url) => {
+                try {
+                    let cached = await cache.match(url);
+                    if (cached) {
+                        let buf = await cached.clone().arrayBuffer();
+                        return buf.byteLength;
+                    }
+                    let res = await fetch(url, { method: 'HEAD' });
+                    let len = res.headers.get('content-length');
+                    return len ? parseInt(len, 10) : 0;
+                } catch (e) {
+                    return 0;
+                }
+            }));
+            return sizes.reduce((a, b) => a + b, 0);
+        }
+
+        async function fetchCached(cache, url) {
+            let cached = await cache.match(url);
+            if (cached) {
+                let buf = await cached.arrayBuffer();
+                loadedChunks++;
+                loadedBytes += buf.byteLength;
+                updateProgress();
+                return buf;
+            }
+            let res = await fetch(url);
+            let storeRes = res.clone();
+            let buf = await res.arrayBuffer();
+            try { await cache.put(url, storeRes); } catch (e) {}
             loadedChunks++;
+            loadedBytes += buf.byteLength;
             updateProgress();
-            return data;
+            return buf;
         }
 
         async function fetchAndReconstruct() {
             try {
+                let cache = await caches.open(CACHE_NAME);
+                totalBytes = await computeTotalBytes(cache);
+                updateProgress();
+
                 let results = {};
                 let fetchTasks = [];
 
@@ -158,7 +214,7 @@
                         let promises = [];
                         for (let j = 0; j < files[i].chunks; j++) {
                             let chunkStr = j < 10 ? '0' + j : j;
-                            promises.push(fetchChunk(baseUrl + files[i].name + chunkStr));
+                            promises.push(fetchCached(cache, baseUrl + files[i].name + chunkStr));
                         }
                         let chunks = await Promise.all(promises);
                         results[files[i].name] = URL.createObjectURL(new Blob(chunks));
@@ -167,8 +223,8 @@
                 }
 
                 let frameworkTask = (async () => {
-                    let frameworkResponse = await fetchChunk(baseUrl + 'web.wasm.framework.unityweb');
-                    results['web.wasm.framework.unityweb'] = URL.createObjectURL(new Blob([frameworkResponse]));
+                    let buf = await fetchCached(cache, baseUrl + 'web.wasm.framework.unityweb');
+                    results['web.wasm.framework.unityweb'] = URL.createObjectURL(new Blob([buf]));
                 })();
                 fetchTasks.push(frameworkTask);
 
